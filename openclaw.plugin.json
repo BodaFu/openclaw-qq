@@ -1,0 +1,72 @@
+{
+  "id": "qq",
+  "channels": ["qq"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "description": "Enable/disable the QQ channel"
+      },
+      "accounts": {
+        "type": "object",
+        "description": "Named QQ accounts (key = account ID)",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "botQQ": { "type": "string", "description": "Bot's QQ number" },
+            "botName": { "type": "string", "description": "Bot display name" },
+            "wsUrl": { "type": "string", "description": "NapCat OneBot WebSocket URL" },
+            "token": { "type": "string", "description": "OneBot access token" },
+            "dmPolicy": { "type": "string", "enum": ["open", "pairing", "disabled"] },
+            "groupPolicy": { "type": "string", "enum": ["open", "allowlist", "disabled"] },
+            "groupAllowFrom": { "type": "array", "items": { "type": "string" } },
+            "allowFrom": { "type": "array", "items": { "type": "string" } },
+            "requireMention": { "type": "boolean" },
+            "historyLimit": { "type": "number" },
+            "textChunkLimit": { "type": "number" },
+            "passiveGate": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "model": { "type": "string" },
+                "apiUrl": { "type": "string" },
+                "apiKey": { "type": "string" },
+                "debounceMs": { "type": "number" },
+                "temperature": { "type": "number" },
+                "maxRecentMessages": { "type": "number" }
+              }
+            },
+            "groups": {
+              "type": "object",
+              "description": "Per-group overrides (key = group ID)",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "requireMention": { "type": "boolean" },
+                  "passiveGate": { "type": "object" },
+                  "historyLimit": { "type": "number" }
+                }
+              }
+            },
+            "store": {
+              "type": "object",
+              "properties": {
+                "mongoUri": { "type": "string" },
+                "dbName": { "type": "string" },
+                "tokenThreshold": { "type": "number" },
+                "compactKeepRecent": { "type": "number" },
+                "compactModel": { "type": "string" },
+                "compactApiUrl": { "type": "string" },
+                "compactApiKey": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
