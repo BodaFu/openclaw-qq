@@ -4,7 +4,7 @@
 
 将你的 OpenClaw AI Agent 接入 QQ，支持私聊、群聊、个性化人格定制、LLM 智能回复门控、MongoDB 消息持久化，以及 Web 群管理面板。
 
-[English →](./README.en.md)
+[English →](./README.en.md) · [接入指南 →](./docs/setup-guide.md)
 
 ---
 
