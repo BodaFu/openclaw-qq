@@ -9,6 +9,7 @@ export type AdminGlobalConfig = {
   requireMention: boolean;
   passiveGateEnabled: boolean;
   debounceMs: number;
+  dmDebounceMs?: number;
   historyLimit: number;
 };
 

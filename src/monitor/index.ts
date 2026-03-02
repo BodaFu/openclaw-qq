@@ -1,6 +1,6 @@
 import type { ClawdbotConfig, RuntimeEnv, HistoryEntry } from "openclaw/plugin-sdk";
 import { OneBotClient } from "../onebot/client.js";
-import type { OneBotMessageEvent, OneBotNoticeEvent } from "../onebot/types.js";
+import type { OneBotMessageEvent, OneBotNoticeEvent, OneBotPrivateMessageEvent } from "../onebot/types.js";
 import type { ResolvedQQAccount } from "../types.js";
 import { handleQQMessage } from "./message-handler.js";
 import { handleGroupFileUpload } from "./file-handler.js";
@@ -9,6 +9,7 @@ import { setActiveClient } from "./client-ref.js";
 import { connectMongo, disconnectMongo } from "../store/connection.js";
 import { loadRecentMessages, appendMessage } from "../store/chat-store.js";
 import { segmentsToText } from "../utils/message-parser.js";
+import { isBotMentioned } from "../utils/mention.js";
 import type { ChatMessage } from "../store/types.js";
 import { ensureAdminIndexes, migrateFromJsonIfNeeded, loadAdminConfig } from "../admin/admin-store.js";
 
@@ -129,8 +130,14 @@ export async function monitorQQProvider(opts: MonitorQQOpts): Promise<void> {
       const restored = [...chatHistories.values()].reduce((s, e) => s + e.length, 0);
       if (restored > 0) log(`[QQ] 从 MongoDB 恢复 ${restored} 条历史消息`);
 
-      // Backfill offline messages from QQ history API
+      // Backfill offline messages from QQ history API.
+      // Messages within the offline window that need a reply are dispatched to the agent.
+      const OFFLINE_WINDOW_MS = 5 * 60 * 1000;
+      const backfillCutoff = Date.now() - OFFLINE_WINDOW_MS;
+      const botQQNum = Number(account.botQQ);
       let totalBackfilled = 0;
+      const pendingGroupReplies: OneBotMessageEvent[] = [];
+
       for (const group of groups) {
         try {
           const groupIdStr = String(group.group_id);
@@ -141,12 +148,16 @@ export async function monitorQQProvider(opts: MonitorQQOpts): Promise<void> {
           const historyResp = await client.getGroupMsgHistory(group.group_id, 0, 30);
           const qqMessages = historyResp?.messages ?? [];
 
-          const botQQNum = Number(account.botQQ);
           let backfilled = 0;
+          let lastMentionEvent: OneBotMessageEvent | null = null;
+
           for (const msg of qqMessages) {
             if (!("message_id" in msg)) continue;
             const ev = msg as OneBotMessageEvent;
-            if (ev.user_id === botQQNum) continue;
+            if (ev.user_id === botQQNum) {
+              lastMentionEvent = null;
+              continue;
+            }
             const msgIdStr = String(ev.message_id);
             if (existingIds.has(msgIdStr)) continue;
 
@@ -154,32 +165,124 @@ export async function monitorQQProvider(opts: MonitorQQOpts): Promise<void> {
             const content = segmentsToText(ev.message);
             if (!content.trim()) continue;
 
+            const msgTimestamp = (ev.time ?? Math.floor(Date.now() / 1000)) * 1000;
             const chatMsg: ChatMessage = {
               messageId: msgIdStr,
               sender: senderName,
               senderId: String(ev.user_id),
               content,
-              timestamp: (ev.time ?? Math.floor(Date.now() / 1000)) * 1000,
+              timestamp: msgTimestamp,
               role: "user",
             };
             await appendMessage(chatKey, chatMsg, account.store);
             existing.push({
               sender: String(ev.user_id),
               body: `${senderName}: ${content}`,
-              timestamp: chatMsg.timestamp,
+              timestamp: msgTimestamp,
               messageId: msgIdStr,
             });
             backfilled++;
+
+            if (msgTimestamp >= backfillCutoff && isBotMentioned(ev.message, account.botQQ)) {
+              lastMentionEvent = ev;
+            }
           }
           if (backfilled > 0) {
             chatHistories.set(groupIdStr, existing);
             totalBackfilled += backfilled;
           }
+          if (lastMentionEvent) {
+            pendingGroupReplies.push(lastMentionEvent);
+          }
         } catch {
           // Non-critical: some groups may not support history API
         }
       }
-      if (totalBackfilled > 0) log(`[QQ] 从 QQ 历史补齐 ${totalBackfilled} 条离线消息`);
+      if (totalBackfilled > 0) log(`[QQ] 从 QQ 历史补齐 ${totalBackfilled} 条群离线消息`);
+
+      // Backfill private (DM) offline messages
+      let dmBackfilled = 0;
+      const pendingDmReplies: OneBotPrivateMessageEvent[] = [];
+      try {
+        const friends = await client.getFriendList();
+        for (const friend of friends) {
+          try {
+            const userId = friend.user_id;
+            const chatKey = `private:${userId}`;
+            const existingMsgs = await loadRecentMessages(chatKey, 5);
+            const existingIds = new Set(existingMsgs.map((m) => m.messageId));
+
+            const historyResp = await client.getFriendMsgHistory(userId, 0, 20);
+            const qqMessages = historyResp?.messages ?? [];
+
+            let hasNewUserMsg = false;
+            let lastUserEvent: OneBotPrivateMessageEvent | null = null;
+
+            for (const msg of qqMessages) {
+              if (!("message_id" in msg)) continue;
+              const ev = msg as OneBotMessageEvent;
+              const msgIdStr = String(ev.message_id);
+              if (existingIds.has(msgIdStr)) continue;
+
+              const senderName = ev.sender?.nickname ?? `QQ用户${ev.user_id}`;
+              const content = segmentsToText(ev.message);
+              if (!content.trim()) continue;
+
+              const msgTimestamp = (ev.time ?? Math.floor(Date.now() / 1000)) * 1000;
+              const isBotMsg = ev.user_id === botQQNum;
+
+              const chatMsg: ChatMessage = {
+                messageId: msgIdStr,
+                sender: senderName,
+                senderId: String(ev.user_id),
+                content,
+                timestamp: msgTimestamp,
+                role: isBotMsg ? "bot" : "user",
+              };
+              await appendMessage(chatKey, chatMsg, account.store);
+              dmBackfilled++;
+
+              if (!isBotMsg && msgTimestamp >= backfillCutoff) {
+                hasNewUserMsg = true;
+                lastUserEvent = ev as OneBotPrivateMessageEvent;
+              }
+              if (isBotMsg) {
+                hasNewUserMsg = false;
+                lastUserEvent = null;
+              }
+            }
+
+            if (hasNewUserMsg && lastUserEvent) {
+              pendingDmReplies.push(lastUserEvent);
+            }
+          } catch {
+            // Non-critical: skip this friend
+          }
+        }
+      } catch (err) {
+        log(`[QQ] 获取好友列表失败: ${String(err)}`);
+      }
+      if (dmBackfilled > 0) log(`[QQ] 从 QQ 历史补齐 ${dmBackfilled} 条私聊离线消息`);
+
+      // Dispatch pending replies for offline messages.
+      // handleQQMessage's dedup (isMessageDuplicate) ensures these won't be
+      // double-processed if NapCat also pushes them via the live WebSocket.
+      const totalPending = pendingGroupReplies.length + pendingDmReplies.length;
+      if (totalPending > 0) {
+        log(`[QQ] 发现 ${totalPending} 条离线消息需要回复（群: ${pendingGroupReplies.length}, 私聊: ${pendingDmReplies.length}）`);
+        for (const ev of [...pendingGroupReplies, ...pendingDmReplies]) {
+          handleQQMessage({
+            cfg: config,
+            event: ev,
+            client,
+            account,
+            runtime,
+            chatHistories,
+          }).catch((err) => {
+            log(`[QQ] 离线消息回复失败: ${String(err)}`);
+          });
+        }
+      }
     } catch (err) {
       log(`[QQ] 获取群列表失败: ${String(err)}`);
     }

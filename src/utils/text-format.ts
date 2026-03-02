@@ -5,6 +5,46 @@
  * 这里将 LLM 输出的 markdown 转换为 QQ 友好的纯文本格式。
  */
 
+const THINKING_TAG_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/gi;
+const THINKING_QUICK_RE = /<\s*\/?\s*(?:think(?:ing)?|thought|antthinking)\b/i;
+
+/**
+ * 剥离 LLM 的思考过程标签（<think>...</think> 等）。
+ * Kimi K2.5 等模型会把 reasoning 内容混在 content 中用 think 标签包裹，
+ * 而非放在 reasoning_content 字段，需要在发送前清洗。
+ *
+ * 参考 openclaw 核心的 reasoning-tags.ts，简化实现（不处理代码块内的标签，
+ * QQ 场景下代码块极少且不影响用户体验）。
+ */
+export function stripThinkingTags(text: string): string {
+  if (!text || !THINKING_QUICK_RE.test(text)) return text;
+
+  THINKING_TAG_RE.lastIndex = 0;
+  let result = "";
+  let lastIndex = 0;
+  let inThinking = false;
+
+  for (const match of text.matchAll(THINKING_TAG_RE)) {
+    const idx = match.index ?? 0;
+    const isClose = match[1] === "/";
+
+    if (!inThinking) {
+      result += text.slice(lastIndex, idx);
+      if (!isClose) inThinking = true;
+    } else if (isClose) {
+      inThinking = false;
+    }
+
+    lastIndex = idx + match[0].length;
+  }
+
+  if (!inThinking) {
+    result += text.slice(lastIndex);
+  }
+
+  return result.trim();
+}
+
 /**
  * 将 markdown 格式文本转换为 QQ 友好的纯文本。
  * 保留语义结构（换行、列表层级），去除所有 markdown 语法标记。

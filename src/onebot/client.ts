@@ -311,6 +311,18 @@ export class OneBotClient extends EventEmitter {
     });
   }
 
+  async getFriendMsgHistory(
+    userId: number,
+    messageSeq?: number,
+    count = 20,
+  ): Promise<{ messages: OneBotEvent[] }> {
+    return this.callApi<{ messages: OneBotEvent[] }>("get_friend_msg_history", {
+      user_id: userId,
+      message_seq: messageSeq ?? 0,
+      count,
+    });
+  }
+
   async getFile(fileId: string): Promise<{
     file: string;
     url: string;

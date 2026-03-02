@@ -14,7 +14,7 @@ import { segmentsToText, buildReplySegments, extractReplyId, extractImageUrls } 
 import { isBotMentioned } from "../utils/mention.js";
 import { getGroupMemberInfo, resolveMemberDisplayName, resolveUserDisplayName, isEffectivelyEmpty } from "../utils/member-cache.js";
 import { resolveQQMediaList } from "../utils/media.js";
-import { stripMarkdown, splitLongText } from "../utils/text-format.js";
+import { stripThinkingTags, stripMarkdown, splitLongText } from "../utils/text-format.js";
 import {
   evaluatePassiveGate,
   enqueuePassiveMessage,
@@ -25,6 +25,14 @@ import {
   cancelPendingPassiveGate,
   type GateMessage,
 } from "./passive-gate.js";
+import {
+  enqueueDmMessage,
+  startDmDispatch,
+  endDmDispatch,
+  hasPendingDmMessages,
+  DM_DEBOUNCE_MS_DEFAULT,
+  type DmPendingMessage,
+} from "./dm-gate.js";
 import { appendMessage as appendToStore, isFirstConversation, loadMessagesSinceLastBot } from "../store/chat-store.js";
 import type { ChatMessage, ChatStoreConfig } from "../store/types.js";
 import { loadAdminConfig, resolveGroupAdmin } from "../admin/admin-store.js";
@@ -220,7 +228,6 @@ async function handlePrivateMessage(params: PrivateMessageParams): Promise<void>
   const { cfg, account, runtime, client, senderId, senderName, messageText, messageId, replyToId, mediaPayload, quotedContent } =
     params;
   const log = runtime.log ?? console.log;
-  const core = getQQRuntime();
 
   const adminCfg = await loadAdminConfig();
   if (adminCfg.global.dmPolicy === "disabled") return;
@@ -274,260 +281,342 @@ async function handlePrivateMessage(params: PrivateMessageParams): Promise<void>
     }
   }
 
-  const qqFrom = `qq:${senderId}`;
-  const qqTo = `user:${senderId}`;
+  const debounceMs = adminCfg.global.dmDebounceMs ?? DM_DEBOUNCE_MS_DEFAULT;
 
-  const route = core.channel.routing.resolveAgentRoute({
-    cfg,
-    channel: "qq",
-    accountId: account.accountId,
-    peer: { kind: "direct", id: senderId },
-  });
+  enqueueDmMessage(
+    senderId,
+    { senderName, text: messageText, timestamp: Date.now(), messageId },
+    debounceMs,
+    (accumulatedMessages) => {
+      const lastMsg = accumulatedMessages[accumulatedMessages.length - 1]!;
+      void dispatchDmReply({
+        cfg,
+        account,
+        runtime,
+        client,
+        senderId,
+        senderName: lastMsg.senderName,
+        messageText: lastMsg.text,
+        messageId: lastMsg.messageId,
+        replyToId,
+        mediaPayload,
+        quotedContent,
+        isFirst,
+      });
+    },
+  );
+}
 
-  const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(cfg);
-  const messageBody = quotedContent
-    ? `${quotedContent}\n${senderName}: ${messageText}`
-    : `${senderName}: ${messageText}`;
-  const body = core.channel.reply.formatAgentEnvelope({
-    channel: "QQ",
-    from: senderId,
-    timestamp: new Date(),
-    envelope: envelopeOptions,
-    body: messageBody,
-  });
+// ── Dispatch private reply to openclaw agent ──
 
-  // Build context from MongoDB (authoritative source) + environment info
-  const userPersona = await loadPersona(senderId).catch(() => null);
-  const botName = account.botName;
-  const personaBlock = userPersona
-    ? [
-        `[该用户的专属 ${botName} 人格设定]`,
-        userPersona.persona,
-        ...(userPersona.nickname ? [`用户称呼: ${userPersona.nickname}`] : []),
-        ...(userPersona.likoNickname ? [`${botName} 昵称: ${userPersona.likoNickname}`] : []),
-      ].join("\n")
-    : [
-        `[${botName} 默认 QQ 风格]`,
-        `你在 QQ 上是好友/搭子，不是助手。聊天风格口语化、随意，像朋友之间发消息。`,
-        `直接、自然、有温度，不装客服腔，不说废话，但也不冷冰冰。`,
-      ].join("\n");
-  const envContext = [
-    "[QQ 会话信息]",
-    "聊天类型: 私聊",
-    `对方昵称: ${senderName}`,
-    `对方QQ: ${senderId}`,
-    ...(isFirst ? ["首次对话: 是"] : []),
-    "",
-    personaBlock,
-  ].join("\n");
+type DispatchDmReplyParams = {
+  cfg: ClawdbotConfig;
+  account: ResolvedQQAccount;
+  runtime: RuntimeEnv;
+  client: OneBotClient;
+  senderId: string;
+  senderName: string;
+  messageText: string;
+  messageId: number;
+  replyToId?: string;
+  mediaPayload?: AgentMediaPayload;
+  quotedContent?: string;
+  isFirst: boolean;
+};
 
-  let finalBody = body;
-  let inboundHistory: Array<{ sender: string; body: string; timestamp?: number }> | undefined;
-  let aggregatedMediaPayload = mediaPayload;
+async function dispatchDmReply(params: DispatchDmReplyParams): Promise<void> {
+  const {
+    cfg, account, runtime, client,
+    senderId, senderName, messageText, messageId,
+    replyToId, quotedContent, isFirst,
+  } = params;
+  let { mediaPayload } = params;
+  const log = runtime.log ?? console.log;
+  const core = getQQRuntime();
+  const chatKey = `private:${senderId}`;
+
+  const abortController = startDmDispatch(senderId);
+  const abortSignal = abortController.signal;
+
   try {
-    const { messages: recentMsgs, summary } = await loadMessagesSinceLastBot(chatKey, 15);
+    const qqFrom = `qq:${senderId}`;
+    const qqTo = `user:${senderId}`;
 
-    // Aggregate images from recent history (within 60s) for split image+text messages
-    if (!aggregatedMediaPayload) {
-      const now = Date.now();
-      const MEDIA_WINDOW_MS = 60_000;
-      const recentMediaPaths: string[] = [];
-      for (let i = recentMsgs.length - 1; i >= 0; i--) {
-        const m = recentMsgs[i]!;
-        if (now - m.timestamp > MEDIA_WINDOW_MS) break;
-        if (m.mediaUrls?.length) {
-          recentMediaPaths.push(...m.mediaUrls);
+    const route = core.channel.routing.resolveAgentRoute({
+      cfg,
+      channel: "qq",
+      accountId: account.accountId,
+      peer: { kind: "direct", id: senderId },
+    });
+
+    const envelopeOptions = core.channel.reply.resolveEnvelopeFormatOptions(cfg);
+    const messageBody = quotedContent
+      ? `${quotedContent}\n${senderName}: ${messageText}`
+      : `${senderName}: ${messageText}`;
+    const body = core.channel.reply.formatAgentEnvelope({
+      channel: "QQ",
+      from: senderId,
+      timestamp: new Date(),
+      envelope: envelopeOptions,
+      body: messageBody,
+    });
+
+    const userPersona = await loadPersona(senderId).catch(() => null);
+    const botName = account.botName;
+    const personaBlock = userPersona
+      ? [
+          `[该用户的专属 ${botName} 人格设定]`,
+          userPersona.persona,
+          ...(userPersona.nickname ? [`用户称呼: ${userPersona.nickname}`] : []),
+          ...(userPersona.likoNickname ? [`${botName} 昵称: ${userPersona.likoNickname}`] : []),
+        ].join("\n")
+      : [
+          `[${botName} 默认 QQ 风格]`,
+          `你在 QQ 上是好友/搭子，不是助手。聊天风格口语化、随意，像朋友之间发消息。`,
+          `直接、自然、有温度，不装客服腔，不说废话，但也不冷冰冰。`,
+        ].join("\n");
+    const envContext = [
+      "[QQ 会话信息]",
+      "平台: QQ（本条消息来自 QQ，不是小红书或其他平台。禁止对 QQ 消息使用小红书相关工具。）",
+      "聊天类型: 私聊",
+      `对方昵称: ${senderName}`,
+      `对方QQ: ${senderId}`,
+      ...(isFirst ? ["首次对话: 是"] : []),
+      "",
+      personaBlock,
+    ].join("\n");
+
+    let finalBody = body;
+    let inboundHistory: Array<{ sender: string; body: string; timestamp?: number }> | undefined;
+    let aggregatedMediaPayload = mediaPayload;
+    try {
+      const { messages: recentMsgs, summary } = await loadMessagesSinceLastBot(chatKey, 15);
+
+      if (!aggregatedMediaPayload) {
+        const now = Date.now();
+        const MEDIA_WINDOW_MS = 60_000;
+        const recentMediaPaths: string[] = [];
+        for (let i = recentMsgs.length - 1; i >= 0; i--) {
+          const m = recentMsgs[i]!;
+          if (now - m.timestamp > MEDIA_WINDOW_MS) break;
+          if (m.mediaUrls?.length) {
+            recentMediaPaths.push(...m.mediaUrls);
+          }
+        }
+        if (recentMediaPaths.length > 0) {
+          aggregatedMediaPayload = buildAgentMediaPayload(
+            recentMediaPaths.map((p) => ({ path: p })),
+          );
+          log(`[QQ] 从历史消息聚合 ${recentMediaPaths.length} 张图片`);
         }
       }
-      if (recentMediaPaths.length > 0) {
-        aggregatedMediaPayload = buildAgentMediaPayload(
-          recentMediaPaths.map((p) => ({ path: p })),
-        );
-        log(`[QQ] 从历史消息聚合 ${recentMediaPaths.length} 张图片`);
-      }
-    }
 
-    const historyMessages = recentMsgs
-      .filter((m) => String(m.messageId) !== String(messageId))
-      .map((m) => {
-        const mediaTag = m.mediaUrls?.length ? ` [图片×${m.mediaUrls.length}]` : "";
-        return core.channel.reply.formatAgentEnvelope({
-          channel: "QQ",
-          from: m.senderId,
-          timestamp: m.timestamp,
-          body: `${m.sender}: ${m.content}${mediaTag}`,
-          envelope: envelopeOptions,
+      const historyMessages = recentMsgs
+        .filter((m) => String(m.messageId) !== String(messageId))
+        .map((m) => {
+          const mediaTag = m.mediaUrls?.length ? ` [图片×${m.mediaUrls.length}]` : "";
+          return core.channel.reply.formatAgentEnvelope({
+            channel: "QQ",
+            from: m.senderId,
+            timestamp: m.timestamp,
+            body: `${m.sender}: ${m.content}${mediaTag}`,
+            envelope: envelopeOptions,
+          });
         });
-      });
 
-    if (historyMessages.length > 0) {
-      finalBody = [
-        "[Chat messages since your last reply - for context]",
-        ...historyMessages,
-        "",
-        "[Current message]",
-        body,
-      ].join("\n");
+      if (historyMessages.length > 0) {
+        finalBody = [
+          "[Chat messages since your last reply - for context]",
+          ...historyMessages,
+          "",
+          "[Current message]",
+          body,
+        ].join("\n");
+      }
+
+      if (summary) {
+        finalBody = `[历史摘要] ${summary}\n\n${finalBody}`;
+      }
+
+      inboundHistory = recentMsgs.map((m) => ({
+        sender: m.senderId,
+        body: `${m.sender}: ${m.content}`,
+        timestamp: m.timestamp,
+      }));
+    } catch {
+      // Fallback: proceed with just the current message
     }
 
-    if (summary) {
-      finalBody = `[历史摘要] ${summary}\n\n${finalBody}`;
-    }
+    finalBody = `${envContext}\n\n${finalBody}`;
 
-    inboundHistory = recentMsgs.map((m) => ({
-      sender: m.senderId,
-      body: `${m.sender}: ${m.content}`,
-      timestamp: m.timestamp,
-    }));
-  } catch {
-    // Fallback: proceed with just the current message
-  }
+    const ctxPayload = core.channel.reply.finalizeInboundContext({
+      Body: finalBody,
+      BodyForAgent: messageBody,
+      InboundHistory: inboundHistory,
+      RawBody: messageText,
+      CommandBody: messageText,
+      From: qqFrom,
+      To: qqTo,
+      SessionKey: route.sessionKey,
+      AccountId: route.accountId,
+      ChatType: "direct",
+      SenderName: senderName,
+      SenderId: senderId,
+      Provider: "qq" as const,
+      Surface: "qq" as const,
+      MessageSid: String(messageId),
+      ReplyToId: replyToId,
+      Timestamp: Date.now(),
+      WasMentioned: false,
+      OriginatingChannel: "qq" as const,
+      OriginatingTo: qqTo,
+      ...aggregatedMediaPayload,
+    });
 
-  finalBody = `${envContext}\n\n${finalBody}`;
+    const dmCollectedBotReplies: string[] = [];
 
-  const ctxPayload = core.channel.reply.finalizeInboundContext({
-    Body: finalBody,
-    BodyForAgent: messageBody,
-    InboundHistory: inboundHistory,
-    RawBody: messageText,
-    CommandBody: messageText,
-    From: qqFrom,
-    To: qqTo,
-    SessionKey: route.sessionKey,
-    AccountId: route.accountId,
-    ChatType: "direct",
-    SenderName: senderName,
-    SenderId: senderId,
-    Provider: "qq" as const,
-    Surface: "qq" as const,
-    MessageSid: String(messageId),
-    ReplyToId: replyToId,
-    Timestamp: Date.now(),
-    WasMentioned: false,
-    OriginatingChannel: "qq" as const,
-    OriginatingTo: qqTo,
-    ...aggregatedMediaPayload,
-  });
+    const { dispatcher, replyOptions, markDispatchIdle } =
+      core.channel.reply.createReplyDispatcherWithTyping({
+        humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId),
+        deliver: async (payload, info) => {
+          if (info.kind === "tool") return;
+          if (abortSignal.aborted) return;
 
-  const dmCollectedBotReplies: string[] = [];
+          // 发送前检查：用户是否在 agent 思考期间补充了新消息
+          if (hasPendingDmMessages(senderId)) {
+            log(`[QQ] 私聊 ${senderId} 发送前检测到新消息，放弃当前回复`);
+            abortController.abort();
+            return;
+          }
 
-  const { dispatcher, replyOptions, markDispatchIdle } =
-    core.channel.reply.createReplyDispatcherWithTyping({
-      humanDelay: core.channel.reply.resolveHumanDelayConfig(cfg, route.agentId),
-      deliver: async (payload, info) => {
-        if (info.kind === "tool") return;
+          const rawText = stripThinkingTags(payload.text ?? "");
+          const mediaUrls = collectMediaUrls(payload);
+          if (!rawText.trim() && mediaUrls.length === 0) return;
 
-        const rawText = payload.text ?? "";
-        const mediaUrls = collectMediaUrls(payload);
-        if (!rawText.trim() && mediaUrls.length === 0) return;
+          const plainText = stripMarkdown(rawText);
+          dmCollectedBotReplies.push(plainText);
+          const textChunks = splitLongText(plainText);
 
-        const plainText = stripMarkdown(rawText);
-        dmCollectedBotReplies.push(plainText);
-        const textChunks = splitLongText(plainText);
-
-        try {
-          for (let i = 0; i < textChunks.length; i++) {
-            const isFirst = i === 0;
-            const isLast = i === textChunks.length - 1;
-            const chunkMediaUrls = isLast ? mediaUrls : [];
-            const segments = buildReplySegments(textChunks[i]!, undefined, undefined, chunkMediaUrls);
-            const sendResult = await client.sendPrivateMsg(Number(senderId), segments);
-
-            if (sendResult?.message_id) {
-              try {
-                await client.getMsg(sendResult.message_id);
-              } catch {
-                log(`[QQ] 私聊消息疑似被风控吞没 ${senderId} (msgId=${sendResult.message_id})`);
-                if (isFirst) {
-                  persistMessageAsync(
-                    chatKey,
-                    toChatMessage({
-                      messageId: "bot-blocked",
-                      sender: account.botName,
-                      senderId: account.botQQ,
-                      content: `[疑似被风控] ${plainText.slice(0, 200)}`,
-                      role: "bot",
-                    }),
-                    account.store,
-                    log,
-                  );
-                }
+          try {
+            for (let i = 0; i < textChunks.length; i++) {
+              if (abortSignal.aborted) return;
+              if (hasPendingDmMessages(senderId)) {
+                log(`[QQ] 私聊 ${senderId} chunk 发送前检测到新消息，放弃剩余回复`);
+                abortController.abort();
                 return;
+              }
+
+              const isFirstChunk = i === 0;
+              const isLast = i === textChunks.length - 1;
+              const chunkMediaUrls = isLast ? mediaUrls : [];
+              const segments = buildReplySegments(textChunks[i]!, undefined, undefined, chunkMediaUrls);
+              const sendResult = await client.sendPrivateMsg(Number(senderId), segments);
+
+              if (sendResult?.message_id) {
+                try {
+                  await client.getMsg(sendResult.message_id);
+                } catch {
+                  log(`[QQ] 私聊消息疑似被风控吞没 ${senderId} (msgId=${sendResult.message_id})`);
+                  if (isFirstChunk) {
+                    persistMessageAsync(
+                      chatKey,
+                      toChatMessage({
+                        messageId: "bot-blocked",
+                        sender: account.botName,
+                        senderId: account.botQQ,
+                        content: `[疑似被风控] ${plainText.slice(0, 200)}`,
+                        role: "bot",
+                      }),
+                      account.store,
+                      log,
+                    );
+                  }
+                  return;
+                }
+              }
+
+              if (!isLast) {
+                await new Promise((r) => setTimeout(r, 300 + Math.random() * 200));
               }
             }
 
-            if (!isLast) {
-              await new Promise((r) => setTimeout(r, 300 + Math.random() * 200));
+            if (textChunks.length === 0 && mediaUrls.length > 0) {
+              const segments = buildReplySegments("", undefined, undefined, mediaUrls);
+              await client.sendPrivateMsg(Number(senderId), segments);
             }
-          }
 
-          if (textChunks.length === 0 && mediaUrls.length > 0) {
-            const segments = buildReplySegments("", undefined, undefined, mediaUrls);
-            await client.sendPrivateMsg(Number(senderId), segments);
+            persistMessageAsync(
+              chatKey,
+              toChatMessage({
+                messageId: "bot",
+                sender: account.botName,
+                senderId: account.botQQ,
+                content: plainText,
+                role: "bot",
+                mediaUrls,
+              }),
+              account.store,
+              log,
+            );
+          } catch (err) {
+            log(`[QQ] 私聊发送失败: ${String(err)}`);
+            persistMessageAsync(
+              chatKey,
+              toChatMessage({
+                messageId: "bot-failed",
+                sender: account.botName,
+                senderId: account.botQQ,
+                content: `[发送失败] ${plainText.slice(0, 200)}`,
+                role: "bot",
+              }),
+              account.store,
+              log,
+            );
+            throw err;
           }
+        },
+        onError: async (error) => {
+          log(`[QQ] 私聊回复错误: ${String(error)}`);
+        },
+        onIdle: async () => {
+          if (abortSignal.aborted) return;
+          const botReply = dmCollectedBotReplies.join("\n").trim();
+          if (botReply) {
+            void distillPersona({
+              userId: senderId,
+              senderName,
+              botName: account.botName,
+              userMessage: messageText,
+              botReply,
+              currentPersona: userPersona,
+              config: account.passiveGate,
+              log,
+            });
+          }
+        },
+        onCleanup: () => {},
+      });
 
-          persistMessageAsync(
-            chatKey,
-            toChatMessage({
-              messageId: "bot",
-              sender: account.botName,
-              senderId: account.botQQ,
-              content: plainText,
-              role: "bot",
-              mediaUrls,
-            }),
-            account.store,
-            log,
-          );
-        } catch (err) {
-          log(`[QQ] 私聊发送失败: ${String(err)}`);
-          persistMessageAsync(
-            chatKey,
-            toChatMessage({
-              messageId: "bot-failed",
-              sender: account.botName,
-              senderId: account.botQQ,
-              content: `[发送失败] ${plainText.slice(0, 200)}`,
-              role: "bot",
-            }),
-            account.store,
-            log,
-          );
-          throw err;
-        }
-      },
-      onError: async (error) => {
-        log(`[QQ] 私聊回复错误: ${String(error)}`);
-      },
-      onIdle: async () => {
-        const botReply = dmCollectedBotReplies.join("\n").trim();
-        if (botReply) {
-          void distillPersona({
-            userId: senderId,
-            senderName,
-            botName: account.botName,
-            userMessage: messageText,
-            botReply,
-            currentPersona: userPersona,
-            config: account.passiveGate,
-            log,
-          });
-        }
-      },
-      onCleanup: () => {},
+    log(`[QQ] 分发私聊到 Agent (session=${route.sessionKey}, user=${senderId})`);
+
+    await core.channel.reply.withReplyDispatcher({
+      dispatcher,
+      onSettled: () => markDispatchIdle(),
+      run: () =>
+        core.channel.reply.dispatchReplyFromConfig({
+          ctx: ctxPayload,
+          cfg,
+          dispatcher,
+          replyOptions,
+        }),
     });
 
-  await core.channel.reply.withReplyDispatcher({
-    dispatcher,
-    onSettled: () => markDispatchIdle(),
-    run: () =>
-      core.channel.reply.dispatchReplyFromConfig({
-        ctx: ctxPayload,
-        cfg,
-        dispatcher,
-        replyOptions,
-      }),
-  });
+    if (abortSignal.aborted) {
+      log(`[QQ] 私聊 ${senderId} 回复已被打断（用户发送了新消息）`);
+    }
+  } finally {
+    endDmDispatch(senderId);
+  }
 }
 
 // ── Group message: mention gating + passive gate ──
@@ -830,6 +919,7 @@ async function dispatchGroupReply(params: DispatchGroupReplyParams): Promise<voi
       ].join("\n");
   const envContext = [
     "[QQ 会话信息]",
+    "平台: QQ（本条消息来自 QQ，不是小红书或其他平台。禁止对 QQ 消息使用小红书相关工具。）",
     "聊天类型: 群聊",
     `群名: ${groupName}`,
     `群号: ${groupIdStr}`,
@@ -941,7 +1031,7 @@ async function dispatchGroupReply(params: DispatchGroupReplyParams): Promise<voi
         if (info.kind === "tool") return;
         if (abortSignal?.aborted) return;
 
-        const rawText = payload.text ?? "";
+        const rawText = stripThinkingTags(payload.text ?? "");
         const mediaUrls = collectMediaUrls(payload);
         if (!rawText.trim() && mediaUrls.length === 0) return;
 
