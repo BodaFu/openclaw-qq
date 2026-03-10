@@ -146,6 +146,7 @@ async function handlePostGroup(req: IncomingMessage, res: ServerResponse): Promi
 export function registerQQAdminRoutes(api: OpenClawPluginApi): void {
   api.registerHttpRoute({
     path: "/qq/admin",
+    auth: "plugin",
     handler: (_req, res) => {
       sendHtml(res, renderAdminPage());
     },
@@ -153,6 +154,7 @@ export function registerQQAdminRoutes(api: OpenClawPluginApi): void {
 
   api.registerHttpRoute({
     path: "/qq/admin/api/config",
+    auth: "plugin",
     handler: async (req, res) => {
       if (req.method === "GET") {
         await handleGetConfig(req, res);
@@ -164,6 +166,7 @@ export function registerQQAdminRoutes(api: OpenClawPluginApi): void {
 
   api.registerHttpRoute({
     path: "/qq/admin/api/global",
+    auth: "plugin",
     handler: async (req, res) => {
       if (req.method === "POST") {
         await handlePostGlobal(req, res);
@@ -175,6 +178,7 @@ export function registerQQAdminRoutes(api: OpenClawPluginApi): void {
 
   api.registerHttpRoute({
     path: "/qq/admin/api/group",
+    auth: "plugin",
     handler: async (req, res) => {
       if (req.method === "POST") {
         await handlePostGroup(req, res);
